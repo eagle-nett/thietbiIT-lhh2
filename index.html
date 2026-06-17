@@ -1,0 +1,824 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>IT Asset Manager</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.23.5/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+* { font-family: 'Segoe UI', system-ui, sans-serif; }
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+body { margin: 0; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.spin { animation: spin 0.8s linear infinite; }
+</style>
+</head>
+<body class="bg-gray-50">
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+// ════════════════════════════════════════════════════════════
+//  ⚙️  CẤU HÌNH — Thay URL Apps Script vào đây
+// ════════════════════════════════════════════════════════════
+const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycby3hGhsQvMwurDdaeatL5iTX8l4bBdk7jvNktz58jYCx4ywFbrILHFjg15NGaLa7-dI/exec';
+// ════════════════════════════════════════════════════════════
+
+const API_READY = SCRIPT_URL && !SCRIPT_URL.includes('PASTE');
+
+// ═══════════════════ CONSTANTS ═══════════════════
+const PAGES = { DASH:'dash', PC:'pc', PR:'pr', SV:'sv', SUM:'sum', HIST:'hist' };
+const COMPANIES   = ['LHH','TTP','AVC','M4H','Lâm Hải','Osaka'];
+const DEPARTMENTS = ['Ban Giám đốc','IT','Kế toán','Kinh doanh','Nhân sự','Hành chính','Sản xuất','Kho vận','Marketing','Kỹ thuật','Bảo trì'];
+const PC_TYPES    = ['Laptop','PC'];
+const PR_TYPES    = ['Máy in','Máy photo'];
+const SV_TYPES    = ['NAS','Server','Switch','Đầu ghi','Camera'];
+const PC_STATUS   = ['Đang dùng','Trong kho','Hỏng'];
+const TYPE_LABEL  = { pc:'Máy tính/Laptop', pr:'Máy in/Photo', sv:'Server & Thiết bị' };
+
+// ═══════════════════ API & STORAGE ═══════════════════
+// Images lưu local theo itemId (Sheets không lưu ảnh được)
+const loadImg  = id  => { try { return localStorage.getItem('img_' + id) || null; } catch { return null; } };
+const saveImg  = (id, b64) => { try { b64 ? localStorage.setItem('img_' + id, b64) : localStorage.removeItem('img_' + id); } catch {} };
+
+// Gọi Apps Script (GET với data encode vào query param)
+const apiCall = async (payload) => {
+  if (!API_READY) throw new Error('Chưa cấu hình SCRIPT_URL');
+  const sep = SCRIPT_URL.includes('?') ? '&' : '?';
+  const url = payload
+    ? `${SCRIPT_URL}${sep}d=${encodeURIComponent(JSON.stringify(payload))}`
+    : SCRIPT_URL;
+  const res = await fetch(url, { redirect: 'follow' });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = await res.json();
+  if (!data.ok) throw new Error(data.error || 'Lỗi từ Apps Script');
+  return data;
+};
+
+// ═══════════════════ UTILITIES ═══════════════════
+const genId    = () => Math.random().toString(36).substr(2, 9);
+const nowISO   = () => new Date().toISOString();
+const todayStr = () => new Date().toISOString().slice(0, 10);
+const fmtDT    = s => { if (!s) return '—'; const d = new Date(s); return d.toLocaleDateString('vi-VN',{day:'2-digit',month:'2-digit',year:'numeric'}) + ' ' + d.toLocaleTimeString('vi-VN',{hour:'2-digit',minute:'2-digit'}); };
+const fmtD     = s => { if (!s) return '—'; try { const [y,m,d] = s.split('-'); return `${d}/${m}/${y}`; } catch { return s; } };
+
+const getNextItemId = (assets) => {
+  if (!assets.length) return 'IT-0001';
+  const nums = assets.map(a => parseInt(a.itemId?.replace('IT-','')) || 0);
+  return `IT-${String(Math.max(...nums) + 1).padStart(4,'0')}`;
+};
+
+const compressImage = file => new Promise(resolve => {
+  const reader = new FileReader();
+  reader.onload = e => {
+    const img = new Image();
+    img.onload = () => {
+      const MAX = 600; let w = img.width, h = img.height;
+      if (w > MAX) { h = Math.round(h*MAX/w); w = MAX; }
+      if (h > MAX) { w = Math.round(w*MAX/h); h = MAX; }
+      const c = document.createElement('canvas'); c.width=w; c.height=h;
+      c.getContext('2d').drawImage(img,0,0,w,h);
+      resolve(c.toDataURL('image/jpeg', 0.72));
+    };
+    img.src = e.target.result;
+  };
+  reader.readAsDataURL(file);
+});
+
+// ═══════════════════ BASE UI ═══════════════════
+const IC = "w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white";
+
+function Toast({ msg, type, onClose }) {
+  useEffect(() => { const t = setTimeout(onClose, 5000); return () => clearTimeout(t); }, []);
+  const c = type === 'error' ? 'bg-red-600' : type === 'ok' ? 'bg-emerald-600' : 'bg-blue-600';
+  return (
+    <div className={`fixed bottom-6 right-6 z-50 ${c} text-white px-4 py-3 rounded-xl shadow-lg flex items-center gap-3 max-w-sm`}>
+      <span className="text-sm flex-1">{msg}</span>
+      <button onClick={onClose} className="opacity-70 hover:opacity-100 text-lg leading-none">×</button>
+    </div>
+  );
+}
+
+function LoadingScreen({ msg = 'Đang tải dữ liệu từ Google Sheets...' }) {
+  return (
+    <div className="min-h-screen bg-gray-50 flex items-center justify-center">
+      <div className="text-center">
+        <div className="w-12 h-12 border-4 border-blue-600 border-t-transparent rounded-full spin mx-auto mb-4"></div>
+        <div className="text-gray-700 font-medium">{msg}</div>
+        <div className="text-gray-400 text-sm mt-1">Lần đầu có thể mất 5–10 giây</div>
+      </div>
+    </div>
+  );
+}
+
+function SetupScreen() {
+  return (
+    <div className="min-h-screen bg-gray-50 flex items-center justify-center p-6">
+      <div className="bg-white rounded-2xl shadow-lg p-8 max-w-xl w-full">
+        <div className="text-5xl mb-4">⚙️</div>
+        <h1 className="text-xl font-bold text-gray-800 mb-2">Cần cấu hình Google Sheets</h1>
+        <p className="text-gray-500 text-sm mb-5">App chưa được kết nối với database. Làm theo các bước sau:</p>
+        <div className="space-y-3 text-sm">
+          {[
+            ['1', 'Mở file', <><strong>google-apps-script.js</strong> và làm theo hướng dẫn bên trong để tạo backend trên Google Sheets.</>],
+            ['2', 'Sau khi Deploy', 'Copy URL dạng https://script.google.com/macros/s/.../exec'],
+            ['3', 'Mở file', <><strong>it-asset-manager.html</strong> bằng Notepad hoặc VS Code</>],
+            ['4', 'Tìm dòng', <><code className="bg-gray-100 px-1.5 py-0.5 rounded text-xs font-mono">const SCRIPT_URL = 'PASTE_YOUR_APPS_SCRIPT_URL_HERE';</code></>],
+            ['5', 'Thay URL', 'Dán URL đã copy vào, lưu file, mở lại bằng trình duyệt'],
+          ].map(([n, bold, rest]) => (
+            <div key={n} className="flex gap-3 items-start">
+              <div className="w-6 h-6 rounded-full bg-blue-600 text-white text-xs flex items-center justify-center flex-shrink-0 mt-0.5">{n}</div>
+              <div><span className="font-medium text-gray-700">{bold} </span><span className="text-gray-500">{rest}</span></div>
+            </div>
+          ))}
+        </div>
+        <div className="mt-5 bg-amber-50 border border-amber-100 rounded-xl p-3 text-xs text-amber-700">
+          💡 Cả 2 file đã có sẵn trong cùng thư mục. Chỉ cần làm theo 5 bước là xong.
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Modal({ title, onClose, size='md', children }) {
+  const w = {sm:'max-w-sm',md:'max-w-lg',lg:'max-w-2xl',xl:'max-w-3xl'}[size]||'max-w-lg';
+  return (
+    <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4" onClick={onClose}>
+      <div className={`bg-white rounded-2xl shadow-2xl w-full ${w} max-h-[90vh] overflow-y-auto`} onClick={e=>e.stopPropagation()}>
+        <div className="flex items-center justify-between px-6 py-4 border-b border-gray-100">
+          <h2 className="text-base font-semibold text-gray-800">{title}</h2>
+          <button onClick={onClose} className="w-7 h-7 rounded-full hover:bg-gray-100 flex items-center justify-center text-gray-400 text-xl">×</button>
+        </div>
+        <div className="px-6 py-5">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+function ConfirmDlg({ message, onConfirm, onCancel, danger=false }) {
+  return (
+    <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
+      <div className="bg-white rounded-2xl p-6 max-w-sm w-full mx-4 shadow-2xl">
+        <p className="text-gray-700 mb-5 text-sm leading-relaxed">{message}</p>
+        <div className="flex justify-end gap-2">
+          <button onClick={onCancel} className="px-4 py-2 rounded-xl border border-gray-200 text-sm">Hủy</button>
+          <button onClick={onConfirm} className={`px-4 py-2 rounded-xl text-sm text-white font-medium ${danger?'bg-red-500':'bg-blue-600'}`}>Xác nhận</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Field({ label, req, children }) {
+  return (
+    <div>
+      <label className="block text-xs font-semibold text-gray-500 mb-1.5 uppercase tracking-wide">
+        {label}{req && <span className="text-red-400 ml-0.5">*</span>}
+      </label>
+      {children}
+    </div>
+  );
+}
+
+function SelectOrInput({ options, value, onChange, placeholder='-- Chọn --' }) {
+  const [showCustom, setShowCustom] = useState(() => !!(value && !options.includes(value)));
+  return (
+    <div className="space-y-1.5">
+      <select className={IC} value={showCustom ? '__other__' : (value||'')}
+        onChange={e => { if(e.target.value==='__other__'){setShowCustom(true);onChange('');}else{setShowCustom(false);onChange(e.target.value);} }}>
+        <option value="">{placeholder}</option>
+        {options.map(o=><option key={o} value={o}>{o}</option>)}
+        <option value="__other__">Khác (nhập)</option>
+      </select>
+      {showCustom && <input className={IC} placeholder="Nhập vào đây..." value={value||''} onChange={e=>onChange(e.target.value)} autoFocus/>}
+    </div>
+  );
+}
+
+function ImageUpload({ value, onChange }) {
+  const ref = useRef();
+  const handle = async e => {
+    const file = e.target.files[0]; if(!file) return;
+    if(file.size > 5*1024*1024){alert('File quá lớn (tối đa 5MB)');return;}
+    onChange(await compressImage(file));
+    e.target.value='';
+  };
+  return (
+    <div>
+      {value
+        ? <div className="relative inline-block">
+            <img src={value} alt="" className="w-36 h-28 object-cover rounded-xl border border-gray-200 shadow-sm"/>
+            <button onClick={()=>onChange(null)} className="absolute -top-2 -right-2 w-5 h-5 bg-red-500 text-white rounded-full text-xs flex items-center justify-center shadow">×</button>
+          </div>
+        : <button type="button" onClick={()=>ref.current?.click()} className="flex items-center gap-2 border-2 border-dashed border-gray-200 text-gray-400 rounded-xl px-4 py-3 text-sm hover:border-blue-300 hover:text-blue-400">
+            📷 Chọn ảnh
+          </button>}
+      <input ref={ref} type="file" accept="image/*" className="hidden" onChange={handle}/>
+    </div>
+  );
+}
+
+function PcStatusBadge({ status }) {
+  const c = status==='Đang dùng'?'bg-green-100 text-green-700 border-green-200':status==='Trong kho'?'bg-blue-100 text-blue-700 border-blue-200':status==='Hỏng'?'bg-red-100 text-red-700 border-red-200':'bg-gray-100 text-gray-600 border-gray-200';
+  return <span className={`text-xs px-2.5 py-0.5 rounded-full font-medium border ${c}`}>{status||'—'}</span>;
+}
+
+// ═══════════════════ ASSET FORM ═══════════════════
+function AssetForm({ type, asset, allAssets, onSave, onClose }) {
+  const isEdit = !!asset;
+  const loaiOpts = type==='pc'?PC_TYPES:type==='pr'?PR_TYPES:SV_TYPES;
+  const blank = { type, id:null, itemId:isEdit?asset.itemId:getNextItemId(allAssets), createdAt:isEdit?asset.createdAt:nowISO(), image:null, ghiChu:'', userName:'', pcName:'', tenThietBi:'', description:'', boPhan:'', loai:loaiOpts[0], ngayMua:'', baoHanh:'', congTy:'LHH', trangThai:type==='pc'?'Trong kho':'' };
+  const [f, setF] = useState(isEdit?{...blank,...asset}:blank);
+  const [err, setErr] = useState('');
+  const set = (k,v) => setF(p=>({...p,[k]:v}));
+
+  const submit = () => {
+    if(type==='pc'&&!f.pcName?.trim()) return setErr('Vui lòng nhập Tên máy tính');
+    if((type==='pr'||type==='sv')&&!f.tenThietBi?.trim()) return setErr('Vui lòng nhập Tên thiết bị');
+    if(!f.boPhan) return setErr('Vui lòng chọn Bộ phận');
+    setErr(''); onSave({...f, id:f.id||genId()});
+  };
+
+  return (
+    <div className="space-y-4">
+      {err && <div className="bg-red-50 border border-red-100 text-red-600 text-sm p-3 rounded-xl">{err}</div>}
+      <div className="grid grid-cols-2 gap-4">
+        <Field label="Mã ItemID"><input className={IC+' bg-gray-50 text-gray-500 font-mono font-semibold'} value={f.itemId} readOnly/></Field>
+        <Field label="Thời gian tạo"><input className={IC+' bg-gray-50 text-gray-500'} value={fmtDT(f.createdAt)} readOnly/></Field>
+      </div>
+      {(type==='pc'||type==='pr') && <Field label="Tên người sử dụng"><input className={IC} value={f.userName} onChange={e=>set('userName',e.target.value)} placeholder="Họ và tên người dùng"/></Field>}
+      {(type==='pr'||type==='sv') && <Field label="Tên thiết bị" req><input className={IC} value={f.tenThietBi} onChange={e=>set('tenThietBi',e.target.value)} placeholder="VD: HP LaserJet Pro M404n"/></Field>}
+      {type==='pc' && <Field label="Tên máy tính" req><input className={IC} value={f.pcName} onChange={e=>set('pcName',e.target.value)} placeholder="VD: LAPTOP-NVAN, PC-KD01"/></Field>}
+      {(type==='pc'||type==='sv') && <Field label="Cấu hình / Mô tả" req><textarea className={IC} rows={2} value={f.description} onChange={e=>set('description',e.target.value)} placeholder={type==='pc'?'Intel Core i5 · 16GB RAM · 512GB SSD · Windows 11':'Thông số kỹ thuật...'}/></Field>}
+      <div className="grid grid-cols-2 gap-4">
+        <Field label="Bộ phận" req><SelectOrInput options={DEPARTMENTS} value={f.boPhan} onChange={v=>set('boPhan',v)} placeholder="-- Chọn bộ phận --"/></Field>
+        <Field label="Loại thiết bị" req><SelectOrInput options={loaiOpts} value={f.loai} onChange={v=>set('loai',v)} placeholder="-- Chọn loại --"/></Field>
+      </div>
+      {type==='pc' && <div className="grid grid-cols-2 gap-4">
+        <Field label="Ngày mua"><input type="date" className={IC} value={f.ngayMua} onChange={e=>set('ngayMua',e.target.value)}/></Field>
+        <Field label="Bảo hành đến"><input type="date" className={IC} value={f.baoHanh} onChange={e=>set('baoHanh',e.target.value)}/></Field>
+      </div>}
+      <div className="grid grid-cols-2 gap-4">
+        <Field label="Công ty"><SelectOrInput options={COMPANIES} value={f.congTy} onChange={v=>set('congTy',v)} placeholder="-- Chọn công ty --"/></Field>
+        {type==='pc' && <Field label="Trạng thái"><SelectOrInput options={PC_STATUS} value={f.trangThai} onChange={v=>set('trangThai',v)} placeholder="-- Trạng thái --"/></Field>}
+      </div>
+      <Field label="Hình ảnh (tùy chọn)"><ImageUpload value={f.image} onChange={v=>set('image',v)}/></Field>
+      <Field label="Ghi chú"><textarea className={IC} rows={2} value={f.ghiChu} onChange={e=>set('ghiChu',e.target.value)}/></Field>
+      <div className="flex justify-end gap-3 pt-1">
+        <button onClick={onClose} className="px-4 py-2.5 rounded-xl border border-gray-200 text-sm">Hủy</button>
+        <button onClick={submit} className="px-5 py-2.5 rounded-xl bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 shadow-sm">{isEdit?'Lưu thay đổi':'Thêm thiết bị'}</button>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════ ASSIGN / RETURN MODALS ═══════════════════
+function AssignModal({ asset, onAssign, onClose }) {
+  const [toUser,setToUser]=useState(''); const [toDept,setToDept]=useState(asset.boPhan||'');
+  const [date,setDate]=useState(todayStr()); const [notes,setNotes]=useState(''); const [err,setErr]=useState('');
+  return (
+    <div className="space-y-4">
+      <div className="bg-blue-50 border border-blue-100 rounded-xl p-3 text-sm">
+        <span className="font-mono font-semibold text-blue-600">{asset.itemId}</span>
+        <span className="text-blue-700 ml-2">— {asset.pcName||asset.tenThietBi}</span>
+        {asset.userName&&<span className="text-blue-500 ml-2 text-xs">(hiện: {asset.userName})</span>}
+      </div>
+      {err&&<div className="text-red-500 text-sm bg-red-50 p-3 rounded-xl">{err}</div>}
+      <Field label="Bàn giao cho" req><input className={IC} value={toUser} onChange={e=>setToUser(e.target.value)} placeholder="Họ và tên người nhận"/></Field>
+      <Field label="Bộ phận người nhận"><SelectOrInput options={DEPARTMENTS} value={toDept} onChange={setToDept} placeholder="-- Bộ phận --"/></Field>
+      <Field label="Ngày bàn giao"><input type="date" className={IC} value={date} onChange={e=>setDate(e.target.value)}/></Field>
+      <Field label="Ghi chú"><textarea className={IC} rows={2} value={notes} onChange={e=>setNotes(e.target.value)} placeholder="Quyết định số, lý do..."/></Field>
+      <div className="flex justify-end gap-2 pt-1">
+        <button onClick={onClose} className="px-4 py-2.5 rounded-xl border border-gray-200 text-sm">Hủy</button>
+        <button onClick={()=>{if(!toUser.trim())return setErr('Vui lòng nhập tên người nhận');onAssign({toUser,toDept,date,notes});}} className="px-5 py-2.5 rounded-xl bg-emerald-600 text-white text-sm font-medium">✓ Bàn giao</button>
+      </div>
+    </div>
+  );
+}
+
+function ReturnModal({ asset, onReturn, onClose }) {
+  const [date,setDate]=useState(todayStr()); const [notes,setNotes]=useState('');
+  return (
+    <div className="space-y-4">
+      <div className="bg-orange-50 border border-orange-100 rounded-xl p-3 text-sm">
+        <div className="font-semibold text-orange-700">{asset.itemId} — {asset.pcName||asset.tenThietBi}</div>
+        {asset.userName&&<div className="text-orange-500 text-xs mt-0.5">Người đang giữ: {asset.userName} ({asset.boPhan})</div>}
+      </div>
+      <Field label="Ngày thu hồi"><input type="date" className={IC} value={date} onChange={e=>setDate(e.target.value)}/></Field>
+      <Field label="Lý do / Ghi chú"><textarea className={IC} rows={2} value={notes} onChange={e=>setNotes(e.target.value)} placeholder="Nghỉ việc, đổi thiết bị, hỏng..."/></Field>
+      <div className="flex justify-end gap-2 pt-1">
+        <button onClick={onClose} className="px-4 py-2.5 rounded-xl border border-gray-200 text-sm">Hủy</button>
+        <button onClick={()=>onReturn({date,notes})} className="px-5 py-2.5 rounded-xl bg-orange-500 text-white text-sm font-medium">↩ Thu hồi</button>
+      </div>
+    </div>
+  );
+}
+
+function DetailModal({ asset, history }) {
+  const chain = history.filter(h=>h.assetId===asset.id).sort((a,b)=>a.date?.localeCompare(b.date));
+  const Row = ({l,v}) => v?<div><div className="text-[10px] text-gray-400 uppercase tracking-wide">{l}</div><div className="text-sm text-gray-800 mt-0.5">{v}</div></div>:null;
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-2 gap-4">
+        <Row l="ItemID" v={<span className="font-mono font-bold text-blue-600">{asset.itemId}</span>}/>
+        <Row l="Nhóm" v={TYPE_LABEL[asset.type]}/>
+        <Row l="Tên máy / Thiết bị" v={asset.pcName||asset.tenThietBi}/>
+        <Row l="Người sử dụng" v={asset.userName||'(chưa bàn giao)'}/>
+        {asset.description&&<div className="col-span-2"><Row l="Cấu hình / Mô tả" v={asset.description}/></div>}
+        <Row l="Bộ phận" v={asset.boPhan}/><Row l="Loại" v={asset.loai}/>
+        <Row l="Công ty" v={asset.congTy}/>
+        {asset.trangThai&&<Row l="Trạng thái" v={<PcStatusBadge status={asset.trangThai}/>}/>}
+        {asset.ngayMua&&<Row l="Ngày mua" v={fmtD(asset.ngayMua)}/>}
+        {asset.baoHanh&&<Row l="Bảo hành đến" v={fmtD(asset.baoHanh)}/>}
+        <Row l="Thời gian tạo" v={fmtDT(asset.createdAt)}/>
+        {asset.ghiChu&&<div className="col-span-2"><Row l="Ghi chú" v={asset.ghiChu}/></div>}
+      </div>
+      {asset.image&&<img src={asset.image} alt="" className="w-full max-h-52 object-contain rounded-xl border border-gray-100 bg-gray-50"/>}
+      {chain.length>0&&(
+        <div className="border-t border-gray-100 pt-4">
+          <div className="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-3">Chuỗi bàn giao ({chain.filter(h=>h.action==='assign').length} thế hệ)</div>
+          <div className="flex items-start flex-wrap gap-1.5">
+            {chain.map((h,i)=>(
+              <React.Fragment key={h.id}>
+                <div className={`text-xs px-3 py-2 rounded-xl border ${h.action==='assign'?'bg-emerald-50 border-emerald-200':'bg-orange-50 border-orange-200'}`}>
+                  <div className={`font-semibold ${h.action==='assign'?'text-emerald-700':'text-orange-600'}`}>{h.action==='assign'?(h.toUser||'—'):'↩ Thu hồi'}</div>
+                  {h.toDept&&h.action==='assign'&&<div className="text-[10px] text-gray-400">{h.toDept}</div>}
+                  <div className="text-[10px] text-gray-400 mt-0.5">{fmtD(h.date)}</div>
+                </div>
+                {i<chain.length-1&&<span className="text-gray-300 text-sm self-center">→</span>}
+              </React.Fragment>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════ ASSET PAGE ═══════════════════
+function AssetPage({ type, assets, allAssets, history, onAdd, onEdit, onDelete, onAssign, onReturn, onExport }) {
+  const [search,setSearch]=useState(''); const [fDept,setFDept]=useState(''); const [fStatus,setFStatus]=useState('');
+  const [showForm,setShowForm]=useState(false); const [editA,setEditA]=useState(null);
+  const [assignA,setAssignA]=useState(null); const [returnA,setReturnA]=useState(null);
+  const [viewA,setViewA]=useState(null); const [delId,setDelId]=useState(null);
+  const meta = {pc:{label:'Máy tính / Laptop',icon:'💻'},pr:{label:'Máy in / Photo',icon:'🖨️'},sv:{label:'Server & Thiết bị mạng',icon:'🖥️'}}[type];
+  const filtered = assets.filter(a => {
+    if(fDept&&a.boPhan!==fDept) return false;
+    if(fStatus&&a.trangThai!==fStatus) return false;
+    const q=search.trim().toLowerCase();
+    // Chỉ tìm theo: mã, tên người dùng, tên máy/thiết bị, bộ phận, loại, công ty
+    // KHÔNG tìm trong description/ghiChu để tránh false positive với từ thông thường
+    return !q||[a.itemId,a.userName,a.pcName,a.tenThietBi,a.boPhan,a.loai,a.congTy].some(v=>v?.toLowerCase().includes(q));
+  });
+  const depts=[...new Set(assets.map(a=>a.boPhan).filter(Boolean))].sort();
+  const closeForm=()=>{setShowForm(false);setEditA(null);};
+  const warnW=d=>{if(!d)return false;const diff=(new Date(d)-new Date())/86400000;return diff>=0&&diff<=90;};
+  const expW=d=>d&&new Date(d)<new Date();
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-6">
+        <div>
+          <h1 className="text-2xl font-bold text-gray-800">{meta.icon} {meta.label}</h1>
+          <p className="text-xs text-gray-400 mt-0.5">{assets.length} thiết bị · {filtered.length} đang hiển thị</p>
+        </div>
+        <div className="flex gap-2">
+          <button onClick={onExport} className="border border-gray-200 text-gray-600 px-3.5 py-2.5 rounded-xl text-sm hover:bg-gray-50">📊 Xuất Excel</button>
+          <button onClick={()=>{setEditA(null);setShowForm(true);}} className="bg-blue-600 text-white px-4 py-2.5 rounded-xl text-sm font-medium hover:bg-blue-700 shadow-sm">＋ Thêm</button>
+        </div>
+      </div>
+      <div className="flex gap-3 mb-5 flex-wrap">
+        <input className="flex-1 min-w-[200px] border border-gray-200 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white" placeholder="Tìm ItemID, tên người, tên máy..." value={search} onChange={e=>setSearch(e.target.value)}/>
+        <select className="border border-gray-200 rounded-xl px-3 py-2.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 min-w-[160px]" value={fDept} onChange={e=>setFDept(e.target.value)}>
+          <option value="">Tất cả bộ phận</option>
+          {depts.map(d=><option key={d} value={d}>{d}</option>)}
+        </select>
+        {type==='pc'&&<select className="border border-gray-200 rounded-xl px-3 py-2.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500" value={fStatus} onChange={e=>setFStatus(e.target.value)}>
+          <option value="">Tất cả trạng thái</option>
+          {PC_STATUS.map(s=><option key={s} value={s}>{s}</option>)}
+        </select>}
+      </div>
+      <div className="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="bg-gray-50 border-b border-gray-100 text-left text-xs font-semibold text-gray-500 uppercase tracking-wide">
+                <th className="px-4 py-3.5 w-28">ItemID</th>
+                <th className="px-4 py-3.5">{type==='sv'?'Tên thiết bị':'Tên máy / Người dùng'}</th>
+                {(type==='pc'||type==='sv')&&<th className="px-4 py-3.5">Cấu hình</th>}
+                <th className="px-4 py-3.5">Bộ phận</th>
+                <th className="px-4 py-3.5">Loại</th>
+                <th className="px-4 py-3.5">Công ty</th>
+                {type==='pc'&&<th className="px-4 py-3.5">Bảo hành</th>}
+                {type==='pc'&&<th className="px-4 py-3.5">Trạng thái</th>}
+                <th className="px-4 py-3.5 text-right">Thao tác</th>
+              </tr>
+            </thead>
+            <tbody key={search+'|'+fDept+'|'+fStatus} className="divide-y divide-gray-50">
+              {filtered.length===0
+                ?<tr><td colSpan="9" className="text-center py-16 text-gray-400">Không tìm thấy thiết bị nào</td></tr>
+                :filtered.map((a,i)=>(
+                  <tr key={a.id+'-'+i} className="hover:bg-gray-50/60">
+                    <td className="px-4 py-3"><div className="font-mono text-xs font-bold text-blue-600">{a.itemId}</div><div className="text-[10px] text-gray-400">{new Date(a.createdAt).toLocaleDateString('vi-VN')}</div></td>
+                    <td className="px-4 py-3">
+                      <div className="font-medium text-gray-800">{a.pcName||a.tenThietBi}</div>
+                      {a.userName?<div className="text-xs text-gray-500 mt-0.5">{a.userName}</div>:type!=='sv'&&<div className="text-xs text-gray-300 italic">Chưa bàn giao</div>}
+                      {a.image&&<span className="text-[10px] text-purple-500">📷</span>}
+                    </td>
+                    {(type==='pc'||type==='sv')&&<td className="px-4 py-3 text-xs text-gray-500 max-w-[180px]"><div className="line-clamp-2">{a.description||'—'}</div></td>}
+                    <td className="px-4 py-3 text-sm text-gray-600">{a.boPhan||'—'}</td>
+                    <td className="px-4 py-3"><span className="text-xs bg-gray-100 text-gray-600 px-2 py-0.5 rounded-full">{a.loai}</span></td>
+                    <td className="px-4 py-3 text-sm text-gray-600">{a.congTy||'—'}</td>
+                    {type==='pc'&&<td className="px-4 py-3 text-xs">{a.baoHanh?<span className={expW(a.baoHanh)?'text-red-500 font-medium':warnW(a.baoHanh)?'text-amber-500 font-medium':'text-gray-500'}>{expW(a.baoHanh)?'⚠ ':warnW(a.baoHanh)?'🔔 ':''}{fmtD(a.baoHanh)}</span>:<span className="text-gray-300">—</span>}</td>}
+                    {type==='pc'&&<td className="px-4 py-3"><PcStatusBadge status={a.trangThai}/></td>}
+                    <td className="px-4 py-3">
+                      <div className="flex items-center justify-end gap-1 flex-wrap">
+                        <button onClick={()=>setViewA(a)} className="px-2 py-1 text-xs rounded-lg bg-gray-50 text-gray-500 hover:bg-gray-100">Chi tiết</button>
+                        <button onClick={()=>setAssignA(a)} className="px-2 py-1 text-xs rounded-lg bg-emerald-50 text-emerald-700 hover:bg-emerald-100">Bàn giao</button>
+                        {a.userName&&<button onClick={()=>setReturnA(a)} className="px-2 py-1 text-xs rounded-lg bg-orange-50 text-orange-700 hover:bg-orange-100">Thu hồi</button>}
+                        <button onClick={()=>{setEditA(a);setShowForm(true);}} className="px-2 py-1 text-xs rounded-lg bg-blue-50 text-blue-600 hover:bg-blue-100">Sửa</button>
+                        <button onClick={()=>setDelId(a.id)} className="px-2 py-1 text-xs rounded-lg bg-red-50 text-red-600 hover:bg-red-100">Xóa</button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      {showForm&&<Modal title={editA?'Chỉnh sửa thiết bị':'Thêm thiết bị mới'} onClose={closeForm} size="lg"><AssetForm type={type} asset={editA} allAssets={allAssets} onSave={d=>{editA?onEdit(d):onAdd(d);closeForm();}} onClose={closeForm}/></Modal>}
+      {assignA&&<Modal title="Bàn giao thiết bị" onClose={()=>setAssignA(null)}><AssignModal asset={assignA} onAssign={d=>{onAssign(assignA.id,d);setAssignA(null);}} onClose={()=>setAssignA(null)}/></Modal>}
+      {returnA&&<Modal title="Thu hồi thiết bị" onClose={()=>setReturnA(null)}><ReturnModal asset={returnA} onReturn={d=>{onReturn(returnA.id,d);setReturnA(null);}} onClose={()=>setReturnA(null)}/></Modal>}
+      {viewA&&<Modal title={`Chi tiết — ${viewA.itemId}`} onClose={()=>setViewA(null)} size="lg"><DetailModal asset={viewA} history={history}/></Modal>}
+      {delId&&<ConfirmDlg message="Xóa thiết bị này? Thao tác không thể hoàn tác." danger onConfirm={()=>{onDelete(delId);setDelId(null);}} onCancel={()=>setDelId(null)}/>}
+    </div>
+  );
+}
+
+// ═══════════════════ SUMMARY PAGE ═══════════════════
+function SummaryPage({ assets, onExport }) {
+  const [search,setSearch]=useState(''); const [fType,setFType]=useState(''); const [fDept,setFDept]=useState(''); const [fCo,setFCo]=useState('');
+  const filtered = assets.filter(a=>{
+    if(fType&&a.type!==fType) return false;
+    if(fDept&&a.boPhan!==fDept) return false;
+    if(fCo&&a.congTy!==fCo) return false;
+    const q=search.trim().toLowerCase();
+    return !q||[a.itemId,a.userName,a.pcName,a.tenThietBi,a.boPhan,a.congTy,a.loai].some(v=>v?.toLowerCase().includes(q));
+  });
+  const depts=[...new Set(assets.map(a=>a.boPhan).filter(Boolean))].sort();
+  const cos=[...new Set(assets.map(a=>a.congTy).filter(Boolean))].sort();
+  const sum={pc:assets.filter(a=>a.type==='pc').length,pr:assets.filter(a=>a.type==='pr').length,sv:assets.filter(a=>a.type==='sv').length};
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-6">
+        <div><h1 className="text-2xl font-bold text-gray-800">📋 Tổng hợp</h1><p className="text-xs text-gray-400 mt-0.5">{assets.length} thiết bị · {filtered.length} đang hiển thị</p></div>
+        <button onClick={onExport} className="bg-emerald-600 text-white px-4 py-2.5 rounded-xl text-sm font-medium hover:bg-emerald-700 shadow-sm">📊 Xuất Excel tất cả</button>
+      </div>
+      <div className="grid grid-cols-3 gap-4 mb-5">
+        {[{t:'pc',icon:'💻',label:'Máy tính/Laptop',c:'bg-blue-50 border-blue-100'},{t:'pr',icon:'🖨️',label:'Máy in/Photo',c:'bg-purple-50 border-purple-100'},{t:'sv',icon:'🖥️',label:'Server & Thiết bị',c:'bg-indigo-50 border-indigo-100'}].map(x=>(
+          <div key={x.t} className={`${x.c} border rounded-2xl p-4 cursor-pointer ${fType===x.t?'ring-2 ring-blue-400':''}`} onClick={()=>setFType(fType===x.t?'':x.t)}>
+            <div className="text-2xl font-bold text-gray-800">{sum[x.t]}</div>
+            <div className="text-sm text-gray-600 mt-0.5">{x.icon} {x.label}</div>
+          </div>
+        ))}
+      </div>
+      <div className="flex gap-3 mb-5 flex-wrap">
+        <input className="flex-1 min-w-[200px] border border-gray-200 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white" placeholder="Tìm kiếm..." value={search} onChange={e=>setSearch(e.target.value)}/>
+        <select className="border border-gray-200 rounded-xl px-3 py-2.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 min-w-[150px]" value={fDept} onChange={e=>setFDept(e.target.value)}><option value="">Tất cả bộ phận</option>{depts.map(d=><option key={d} value={d}>{d}</option>)}</select>
+        <select className="border border-gray-200 rounded-xl px-3 py-2.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 min-w-[120px]" value={fCo} onChange={e=>setFCo(e.target.value)}><option value="">Tất cả công ty</option>{cos.map(c=><option key={c} value={c}>{c}</option>)}</select>
+      </div>
+      <div className="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead><tr className="bg-gray-50 border-b border-gray-100 text-left text-xs font-semibold text-gray-500 uppercase tracking-wide">
+              <th className="px-4 py-3.5">ItemID</th><th className="px-4 py-3.5">Nhóm</th><th className="px-4 py-3.5">Tên thiết bị</th><th className="px-4 py-3.5">Người dùng</th><th className="px-4 py-3.5">Bộ phận</th><th className="px-4 py-3.5">Loại</th><th className="px-4 py-3.5">Công ty</th><th className="px-4 py-3.5">Trạng thái</th><th className="px-4 py-3.5">Ghi chú</th>
+            </tr></thead>
+            <tbody key={search+'|'+fType+'|'+fDept+'|'+fCo} className="divide-y divide-gray-50">
+              {filtered.length===0?<tr><td colSpan="9" className="text-center py-16 text-gray-400">Không có dữ liệu</td></tr>
+                :filtered.map((a,i)=>(
+                  <tr key={a.id+'-'+i} className="hover:bg-gray-50/60">
+                    <td className="px-4 py-3 font-mono text-xs font-bold text-blue-600">{a.itemId}</td>
+                    <td className="px-4 py-3"><span className={`text-xs px-2 py-0.5 rounded-full ${a.type==='pc'?'bg-blue-50 text-blue-700':a.type==='pr'?'bg-purple-50 text-purple-700':'bg-indigo-50 text-indigo-700'}`}>{TYPE_LABEL[a.type]}</span></td>
+                    <td className="px-4 py-3 font-medium text-gray-800">{a.pcName||a.tenThietBi}</td>
+                    <td className="px-4 py-3 text-sm text-gray-600">{a.userName||'—'}</td>
+                    <td className="px-4 py-3 text-sm text-gray-600">{a.boPhan||'—'}</td>
+                    <td className="px-4 py-3 text-xs text-gray-500">{a.loai}</td>
+                    <td className="px-4 py-3 text-sm text-gray-500">{a.congTy||'—'}</td>
+                    <td className="px-4 py-3">{a.trangThai?<PcStatusBadge status={a.trangThai}/>:<span className="text-gray-300">—</span>}</td>
+                    <td className="px-4 py-3 text-xs text-gray-400 max-w-[140px] truncate">{a.ghiChu||'—'}</td>
+                  </tr>
+                ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════ HISTORY PAGE ═══════════════════
+function HistoryPage({ history, onExport }) {
+  const [search,setSearch]=useState(''); const [fAction,setFAction]=useState('');
+  const filtered = history.filter(h=>{
+    if(fAction&&h.action!==fAction) return false;
+    const q=search.toLowerCase();
+    return !q||[h.itemId,h.assetName,h.toUser,h.fromUser,h.toDept,h.fromDept].some(v=>v?.toLowerCase().includes(q));
+  }).sort((a,b)=>b.date?.localeCompare(a.date)||0);
+  const chainMap={};
+  history.forEach(h=>{if(!chainMap[h.assetId])chainMap[h.assetId]=[];chainMap[h.assetId].push(h);});
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-6">
+        <div><h1 className="text-2xl font-bold text-gray-800">📜 Lịch sử bàn giao</h1><p className="text-xs text-gray-400 mt-0.5">{history.length} thao tác</p></div>
+        <button onClick={onExport} className="bg-emerald-600 text-white px-4 py-2.5 rounded-xl text-sm font-medium hover:bg-emerald-700 shadow-sm">📊 Xuất Excel</button>
+      </div>
+      <div className="flex gap-3 mb-5">
+        <input className="flex-1 border border-gray-200 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white" placeholder="Tìm ItemID, tên người, bộ phận..." value={search} onChange={e=>setSearch(e.target.value)}/>
+        <select className="border border-gray-200 rounded-xl px-3 py-2.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500" value={fAction} onChange={e=>setFAction(e.target.value)}><option value="">Tất cả</option><option value="assign">Bàn giao</option><option value="return">Thu hồi</option></select>
+      </div>
+      <div className="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead><tr className="bg-gray-50 border-b border-gray-100 text-left text-xs font-semibold text-gray-500 uppercase tracking-wide">
+              <th className="px-4 py-3.5">Ngày</th><th className="px-4 py-3.5">Loại</th><th className="px-4 py-3.5">Thiết bị</th><th className="px-4 py-3.5">Từ</th><th className="px-4 py-3.5">Đến</th><th className="px-4 py-3.5">Ghi chú</th><th className="px-4 py-3.5">Chuỗi bàn giao</th>
+            </tr></thead>
+            <tbody className="divide-y divide-gray-50">
+              {filtered.length===0?<tr><td colSpan="7" className="text-center py-16 text-gray-400">Không có dữ liệu</td></tr>
+                :filtered.map(h=>{
+                  const chain=(chainMap[h.assetId]||[]).filter(c=>c.action==='assign').sort((a,b)=>a.date?.localeCompare(b.date)||0);
+                  return(
+                    <tr key={h.id} className="hover:bg-gray-50/60">
+                      <td className="px-4 py-3 text-gray-500 text-xs whitespace-nowrap">{fmtD(h.date)}</td>
+                      <td className="px-4 py-3"><span className={`text-xs px-2 py-0.5 rounded-full font-medium ${h.action==='assign'?'bg-emerald-100 text-emerald-700':'bg-orange-100 text-orange-700'}`}>{h.action==='assign'?'Bàn giao':'Thu hồi'}</span></td>
+                      <td className="px-4 py-3"><div className="font-mono text-xs text-blue-600 font-bold">{h.itemId}</div><div className="text-xs text-gray-400">{h.assetName}</div></td>
+                      <td className="px-4 py-3 text-xs text-gray-600">{h.fromUser?<><div>{h.fromUser}</div><div className="text-gray-400">{h.fromDept}</div></>:<span className="italic text-gray-300">Kho</span>}</td>
+                      <td className="px-4 py-3 text-xs font-medium text-gray-800">{h.toUser?<><div>{h.toUser}</div><div className="text-gray-400 font-normal">{h.toDept}</div></>:<span className="italic text-gray-400">Thu về kho</span>}</td>
+                      <td className="px-4 py-3 text-xs text-gray-400">{h.notes||'—'}</td>
+                      <td className="px-4 py-3">
+                        <div className="flex items-center gap-1 flex-wrap max-w-[200px]">
+                          {chain.map((c,i)=>(
+                            <React.Fragment key={c.id}>
+                              <span className={`text-[10px] px-1.5 py-0.5 rounded-lg font-medium ${c.id===h.id?'bg-blue-600 text-white':'bg-gray-100 text-gray-600'}`}>{c.toUser}</span>
+                              {i<chain.length-1&&<span className="text-gray-300 text-[10px]">→</span>}
+                            </React.Fragment>
+                          ))}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════ DASHBOARD ═══════════════════
+function Dashboard({ assets, history }) {
+  const pc=assets.filter(a=>a.type==='pc'),pr=assets.filter(a=>a.type==='pr'),sv=assets.filter(a=>a.type==='sv');
+  const pcInUse=pc.filter(a=>a.trangThai==='Đang dùng').length,pcStock=pc.filter(a=>a.trangThai==='Trong kho').length,pcBroke=pc.filter(a=>a.trangThai==='Hỏng').length;
+  const recent=[...history].sort((a,b)=>b.date?.localeCompare(a.date)||0).slice(0,10);
+  const deptMap={};assets.forEach(a=>{if(a.boPhan)deptMap[a.boPhan]=(deptMap[a.boPhan]||0)+1;});
+  const deptList=Object.entries(deptMap).sort((a,b)=>b[1]-a[1]).slice(0,7);
+  const maxD=Math.max(...deptList.map(d=>d[1]),1);
+  const warnExpiry=assets.filter(a=>{if(!a.baoHanh)return false;const d=(new Date(a.baoHanh)-new Date())/86400000;return d>=0&&d<=90;});
+  const expiredW=assets.filter(a=>a.baoHanh&&new Date(a.baoHanh)<new Date());
+  const Stat=({n,label,sub,color})=>(
+    <div className="bg-white rounded-2xl p-5 border border-gray-100 shadow-sm">
+      <div className={`w-1.5 h-8 rounded-full ${color} mb-3`}></div>
+      <div className="text-3xl font-bold text-gray-800">{n}</div>
+      <div className="text-sm font-semibold text-gray-600 mt-0.5">{label}</div>
+      <div className="text-xs text-gray-400 mt-0.5">{sub}</div>
+    </div>
+  );
+  return (
+    <div>
+      <h1 className="text-2xl font-bold text-gray-800 mb-6">Tổng quan hệ thống</h1>
+      <div className="grid grid-cols-4 gap-4 mb-6">
+        <Stat n={assets.length} label="Tổng thiết bị" sub="toàn hệ thống" color="bg-blue-500"/>
+        <Stat n={pc.length} label="Máy tính / Laptop" sub={`${pcInUse} đang dùng · ${pcStock} kho`} color="bg-indigo-500"/>
+        <Stat n={pr.length} label="Máy in / Photo" sub="văn phòng" color="bg-purple-500"/>
+        <Stat n={sv.length} label="Server & Thiết bị" sub="hạ tầng IT" color="bg-slate-600"/>
+      </div>
+      <div className="grid grid-cols-3 gap-5 mb-5">
+        <div className="bg-white rounded-2xl p-5 border border-gray-100 shadow-sm">
+          <h3 className="font-semibold text-gray-700 text-sm mb-4">Trạng thái máy tính</h3>
+          <div className="space-y-3">
+            {[{l:'Đang dùng',v:pcInUse,c:'bg-green-400'},{l:'Trong kho',v:pcStock,c:'bg-blue-400'},{l:'Hỏng',v:pcBroke,c:'bg-red-400'}].map(s=>(
+              <div key={s.l}>
+                <div className="flex justify-between text-xs text-gray-500 mb-1"><span>{s.l}</span><span className="font-semibold text-gray-700">{s.v}</span></div>
+                <div className="h-1.5 bg-gray-100 rounded-full overflow-hidden"><div className={`h-full ${s.c} rounded-full`} style={{width:`${pc.length?s.v/pc.length*100:0}%`}}/></div>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div className="bg-white rounded-2xl p-5 border border-gray-100 shadow-sm">
+          <h3 className="font-semibold text-gray-700 text-sm mb-4">Phân bổ theo bộ phận</h3>
+          <div className="space-y-2.5">
+            {deptList.map(([d,n])=>(
+              <div key={d}>
+                <div className="flex justify-between text-xs text-gray-500 mb-0.5"><span className="truncate pr-2">{d}</span><span className="font-semibold text-gray-700">{n}</span></div>
+                <div className="h-1.5 bg-gray-100 rounded-full overflow-hidden"><div className="h-full bg-blue-400 rounded-full" style={{width:`${n/maxD*100}%`}}/></div>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div className="bg-white rounded-2xl p-5 border border-gray-100 shadow-sm">
+          <h3 className="font-semibold text-gray-700 text-sm mb-3">Cảnh báo bảo hành</h3>
+          {warnExpiry.length===0&&expiredW.length===0
+            ?<p className="text-gray-400 text-xs text-center py-6">Không có cảnh báo ✓</p>
+            :<div className="space-y-1">
+              {expiredW.slice(0,3).map(a=><div key={a.id} className="flex justify-between items-center py-1.5 border-b border-gray-50 text-xs"><span className="font-mono text-blue-600 font-semibold">{a.itemId}</span><span className="text-red-500 font-medium">⚠ Đã hết {fmtD(a.baoHanh)}</span></div>)}
+              {warnExpiry.slice(0,4).map(a=><div key={a.id} className="flex justify-between items-center py-1.5 border-b border-gray-50 text-xs"><span className="font-mono text-blue-600 font-semibold">{a.itemId}</span><span className="text-amber-500 font-medium">🔔 {fmtD(a.baoHanh)}</span></div>)}
+            </div>}
+        </div>
+      </div>
+      <div className="bg-white rounded-2xl p-5 border border-gray-100 shadow-sm">
+        <h3 className="font-semibold text-gray-700 text-sm mb-3">Hoạt động gần đây</h3>
+        {recent.length===0?<p className="text-gray-400 text-xs text-center py-4">Chưa có hoạt động</p>
+          :<div className="grid grid-cols-2 gap-0.5">
+            {recent.map(h=>(
+              <div key={h.id} className="flex items-center justify-between py-2 px-3 rounded-xl hover:bg-gray-50 text-xs">
+                <div className="flex items-center gap-2">
+                  <span className={`px-1.5 py-0.5 rounded font-semibold text-[10px] ${h.action==='assign'?'bg-emerald-100 text-emerald-700':'bg-orange-100 text-orange-700'}`}>{h.action==='assign'?'BG':'TH'}</span>
+                  <span className="font-mono text-blue-600 font-bold">{h.itemId}</span>
+                  <span className="text-gray-500">{h.toUser||'→ Kho'}</span>
+                </div>
+                <span className="text-gray-400">{fmtD(h.date)}</span>
+              </div>
+            ))}
+          </div>}
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════ SIDEBAR ═══════════════════
+function Sidebar({ page, setPage, assets, onSync, syncing }) {
+  const n=t=>assets.filter(a=>a.type===t).length;
+  const Item=({p,icon,label,count})=>{
+    const active=page===p;
+    return(
+      <button onClick={()=>setPage(p)} className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-sm transition-all ${active?'bg-blue-600 text-white shadow-sm':'text-gray-600 hover:bg-gray-100'}`}>
+        <div className="flex items-center gap-2.5"><span className="text-[15px]">{icon}</span><span className={active?'font-semibold':'font-medium'}>{label}</span></div>
+        {count!==undefined&&<span className={`text-[11px] px-2 py-0.5 rounded-full font-bold ${active?'bg-blue-500 text-white':'bg-gray-200 text-gray-600'}`}>{count}</span>}
+      </button>
+    );
+  };
+  return(
+    <aside className="min-h-screen bg-white border-r border-gray-100 flex flex-col fixed left-0 top-0 bottom-0 z-30" style={{width:'232px'}}>
+      <div className="p-5 border-b border-gray-100">
+        <div className="flex items-center gap-3">
+          <div className="w-9 h-9 bg-gradient-to-br from-blue-500 to-blue-700 rounded-xl flex items-center justify-center text-white font-bold text-sm shadow">IT</div>
+          <div><div className="font-bold text-gray-800 text-sm">Asset Manager</div><div className="text-[11px] text-gray-400">Quản lý tài sản IT</div></div>
+        </div>
+      </div>
+      <nav className="flex-1 p-3 space-y-0.5 overflow-y-auto">
+        <Item p={PAGES.DASH} icon="📊" label="Tổng quan"/>
+        <div className="pt-3 pb-1 px-3 text-[10px] font-bold text-gray-400 uppercase tracking-widest">Thiết bị</div>
+        <Item p={PAGES.PC}   icon="💻" label="Máy tính / Laptop" count={n('pc')}/>
+        <Item p={PAGES.PR}   icon="🖨️" label="Máy in / Photo"    count={n('pr')}/>
+        <Item p={PAGES.SV}   icon="🖥️" label="Server & Thiết bị" count={n('sv')}/>
+        <div className="pt-3 pb-1 px-3 text-[10px] font-bold text-gray-400 uppercase tracking-widest">Báo cáo</div>
+        <Item p={PAGES.SUM}  icon="📋" label="Tổng hợp" count={assets.length}/>
+        <Item p={PAGES.HIST} icon="📜" label="Lịch sử"/>
+      </nav>
+      <div className="p-3 border-t border-gray-100">
+        <button onClick={onSync} disabled={syncing} className="w-full flex items-center justify-center gap-2 py-2 rounded-xl text-xs text-gray-500 hover:bg-gray-50 disabled:opacity-50">
+          <span className={syncing?'spin inline-block':'inline-block'}>🔄</span>
+          {syncing?'Đang đồng bộ...':'Tải lại từ Sheets'}
+        </button>
+        <div className="text-[10px] text-gray-300 text-center mt-1">IT Asset Manager v2.0</div>
+      </div>
+    </aside>
+  );
+}
+
+// ═══════════════════ APP ═══════════════════
+function App() {
+  const [page,    setPage]    = useState(PAGES.DASH);
+  const [assets,  setAssets]  = useState([]);
+  const [history, setHistory] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [syncing, setSyncing] = useState(false);
+  const [toast,   setToast]   = useState(null);
+
+  const showToast = (msg, type='info') => setToast({ msg, type });
+
+  const loadData = useCallback(async (quiet=false) => {
+    if (!API_READY) { setLoading(false); return; }
+    if (!quiet) setLoading(true); else setSyncing(true);
+    try {
+      const data = await apiCall(null);
+      // Loại bỏ trùng id (giữ lại bản cuối cùng)
+      const dedupMap = {};
+      (data.assets||[]).forEach(a => { if (a.id) dedupMap[a.id] = a; });
+      const loadedAssets = Object.values(dedupMap).map(a => ({ ...a, image: loadImg(a.itemId) }));
+      const dedupHistMap = {};
+      (data.history||[]).forEach(h => { if (h.id) dedupHistMap[h.id] = h; });
+      setAssets(loadedAssets);
+      setHistory(Object.values(dedupHistMap));
+      if (quiet) showToast('Đồng bộ thành công!', 'ok');
+    } catch(err) {
+      showToast('Lỗi kết nối: ' + err.message, 'error');
+    } finally {
+      setLoading(false); setSyncing(false);
+    }
+  }, []);
+
+  useEffect(() => { loadData(); }, [loadData]);
+
+  // ── Mutations (optimistic update + sync to Sheets) ──
+  const addAsset = (a) => {
+    const { image, ...data } = a;
+    saveImg(data.itemId, image);
+    setAssets(p => [...p, { ...data, image }]);
+    apiCall({ action:'add', sheet:'assets', payload:data })
+      .catch(err => showToast('Lỗi lưu: ' + err.message, 'error'));
+  };
+
+  const editAsset = (a) => {
+    const { image, ...data } = a;
+    saveImg(data.itemId, image);
+    setAssets(p => p.map(x => x.id===a.id ? { ...data, image } : x));
+    apiCall({ action:'update', sheet:'assets', payload:data })
+      .catch(err => showToast('Lỗi lưu: ' + err.message, 'error'));
+  };
+
+  const deleteAsset = (id) => {
+    setAssets(p => p.filter(x => x.id!==id));
+    apiCall({ action:'delete', sheet:'assets', payload:{ id } })
+      .catch(err => showToast('Lỗi xóa: ' + err.message, 'error'));
+  };
+
+  const assignAsset = (id, { toUser, toDept, date, notes }) => {
+    const a = assets.find(x => x.id===id);
+    const rec = { id:genId(), assetId:id, itemId:a.itemId, assetName:a.pcName||a.tenThietBi, assetType:a.type, fromUser:a.userName||null, toUser, fromDept:a.boPhan||null, toDept, action:'assign', date, notes, createdAt:nowISO() };
+    setAssets(p => p.map(x => x.id===id ? { ...x, userName:toUser, boPhan:toDept||x.boPhan, trangThai:x.type==='pc'?'Đang dùng':x.trangThai } : x));
+    setHistory(p => [...p, rec]);
+    const { image:_, ...updData } = assets.find(x=>x.id===id);
+    const updatedAsset = { ...updData, userName:toUser, boPhan:toDept||updData.boPhan, trangThai:updData.type==='pc'?'Đang dùng':updData.trangThai };
+    apiCall({ action:'update', sheet:'assets',  payload:updatedAsset })
+      .catch(err => showToast('Lỗi lưu: ' + err.message, 'error'));
+    apiCall({ action:'add',    sheet:'history', payload:rec })
+      .catch(err => showToast('Lỗi lưu lịch sử: ' + err.message, 'error'));
+  };
+
+  const returnAsset = (id, { date, notes }) => {
+    const a = assets.find(x => x.id===id);
+    const rec = { id:genId(), assetId:id, itemId:a.itemId, assetName:a.pcName||a.tenThietBi, assetType:a.type, fromUser:a.userName||null, toUser:null, fromDept:a.boPhan||null, toDept:null, action:'return', date, notes, createdAt:nowISO() };
+    setAssets(p => p.map(x => x.id===id ? { ...x, userName:'', trangThai:x.type==='pc'?'Trong kho':x.trangThai } : x));
+    setHistory(p => [...p, rec]);
+    const { image:_, ...updData } = assets.find(x=>x.id===id);
+    const updatedAsset = { ...updData, userName:'', trangThai:updData.type==='pc'?'Trong kho':updData.trangThai };
+    apiCall({ action:'update', sheet:'assets',  payload:updatedAsset })
+      .catch(err => showToast('Lỗi lưu: ' + err.message, 'error'));
+    apiCall({ action:'add',    sheet:'history', payload:rec })
+      .catch(err => showToast('Lỗi lưu lịch sử: ' + err.message, 'error'));
+  };
+
+  // ── Excel export ──
+  const xls = (rows, sheet, filename) => {
+    if (!window.XLSX) { alert('Thư viện chưa tải, thử lại.'); return; }
+    const ws=XLSX.utils.json_to_sheet(rows),wb=XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb,ws,sheet);XLSX.writeFile(wb,filename);
+  };
+
+  const exportType = t => xls(assets.filter(a=>a.type===t).map(a=>({'ItemID':a.itemId,'Thời gian tạo':fmtDT(a.createdAt),'Tên người dùng':a.userName||'','Tên thiết bị/Tên máy':a.pcName||a.tenThietBi||'','Cấu hình/Mô tả':a.description||'','Bộ phận':a.boPhan||'','Loại':a.loai||'','Công ty':a.congTy||'',...(t==='pc'?{'Ngày mua':fmtD(a.ngayMua),'Bảo hành đến':fmtD(a.baoHanh),'Trạng thái':a.trangThai||''}:{}),'Ghi chú':a.ghiChu||''})), TYPE_LABEL[t], `${t}-${todayStr()}.xlsx`);
+
+  const exportSummary = () => xls(assets.map(a=>({'ItemID':a.itemId,'Nhóm':TYPE_LABEL[a.type],'Thời gian tạo':fmtDT(a.createdAt),'Tên người dùng':a.userName||'','Tên thiết bị/Tên máy':a.pcName||a.tenThietBi||'','Cấu hình/Mô tả':a.description||'','Bộ phận':a.boPhan||'','Loại':a.loai||'','Công ty':a.congTy||'','Ngày mua':fmtD(a.ngayMua),'Bảo hành đến':fmtD(a.baoHanh),'Trạng thái':a.trangThai||'','Ghi chú':a.ghiChu||''})), 'Tổng hợp', `tong-hop-${todayStr()}.xlsx`);
+
+  const exportHistory = () => xls([...history].sort((a,b)=>b.date?.localeCompare(a.date)||0).map(h=>({'Ngày':fmtD(h.date),'Loại':h.action==='assign'?'Bàn giao':'Thu hồi','ItemID':h.itemId,'Tên thiết bị':h.assetName,'Nhóm':TYPE_LABEL[h.assetType]||'','Từ (người cũ)':h.fromUser||'(Kho)','Bộ phận cũ':h.fromDept||'','Đến (người mới)':h.toUser||'(Thu về kho)','Bộ phận mới':h.toDept||'','Ghi chú':h.notes||''})), 'Lịch sử', `lich-su-${todayStr()}.xlsx`);
+
+  const ap = t => ({ type:t, assets:assets.filter(a=>a.type===t), allAssets:assets, history, onAdd:addAsset, onEdit:editAsset, onDelete:deleteAsset, onAssign:assignAsset, onReturn:returnAsset, onExport:()=>exportType(t) });
+
+  if (!API_READY) return <SetupScreen/>;
+  if (loading) return <LoadingScreen/>;
+
+  return (
+    <div className="flex min-h-screen bg-gray-50">
+      <Sidebar page={page} setPage={setPage} assets={assets} onSync={()=>loadData(true)} syncing={syncing}/>
+      <main className="flex-1 p-8 min-h-screen" style={{marginLeft:'232px'}}>
+        {page===PAGES.DASH && <Dashboard assets={assets} history={history}/>}
+        {page===PAGES.PC   && <AssetPage {...ap('pc')}/>}
+        {page===PAGES.PR   && <AssetPage {...ap('pr')}/>}
+        {page===PAGES.SV   && <AssetPage {...ap('sv')}/>}
+        {page===PAGES.SUM  && <SummaryPage assets={assets} onExport={exportSummary}/>}
+        {page===PAGES.HIST && <HistoryPage history={history} onExport={exportHistory}/>}
+      </main>
+      {toast && <Toast msg={toast.msg} type={toast.type} onClose={()=>setToast(null)}/>}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
